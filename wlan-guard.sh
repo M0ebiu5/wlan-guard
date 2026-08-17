@@ -11,8 +11,8 @@
 #                IPv4 that its lease/reservation does not grant it
 #   BLOCK      = the unauthorized IPv4 address(es) of a candidate that is
 #                transferring faster than RATE_THRESHOLD_KB
-#   keep       = an already-blocked IP that is still held by a candidate
-#   UNBLOCK    = a blocked IP no longer held by any candidate (device left the
+#   keep       = an already-blocked IP whose hold has not run out yet
+#   UNBLOCK    = a blocked IP whose BLOCK_HOLD_HOURS hold has expired (the
 #                air, went back to its own address, or moved again)
 #
 # The test is on the PAIR, not the MAC. Holding a lease does not entitle a
@@ -28,11 +28,15 @@
 # network is the stable handle, so that is what we drop. A device sitting on
 # the address it was granted is never touched, MAC-random or not.
 #
-# The transfer-rate test is the BLOCK trigger only. Once an IP is blocked its
-# traffic is dropped, so its measured rate falls to ~0 — if rate also gated
-# *keeping* the block it would flap. Instead a block is held until the IP is
-# no longer held by a candidate. That matches "unblock it if it is no longer in
-# the network."
+# The transfer-rate test is the BLOCK trigger only, and time is the only thing
+# that releases a block. Both directions of evidence decay once an IP is
+# dropped: its measured rate falls to ~0 because we are dropping its traffic,
+# and its neighbour entry goes stale or is garbage-collected because the block
+# stops the very packets that kept the entry fresh. Gating either *keeping* the
+# block on that evidence makes blocks flap — observed in the field as block,
+# release three minutes later, re-block on the next burst. So a block simply
+# stands for BLOCK_HOLD_HOURS and is then released; if the address is still
+# being misused, the next run blocks it again.
 #
 # Authorized pairs = active DHCP leases (/tmp/dhcp.leases: the MAC the router
 # actually handed each IP to) plus static reservations (uci dhcp 'host' with
@@ -95,6 +99,15 @@ RATE_THRESHOLD_KB="${RATE_THRESHOLD_KB:-30}"           # block only if kB/s exce
 SAMPLE_SECONDS="${SAMPLE_SECONDS:-4}"                  # throughput sample window
 CT_FILE="${CT_FILE:-/proc/net/nf_conntrack}"
 
+# How long a block is held once placed. Time is the ONLY release criterion.
+# Presence evidence decays while an IP is dropped -- the block stops the very
+# traffic that keeps the neighbour entry fresh -- so releasing a block on
+# "device looks gone" made blocks flap: blocked, released a few minutes later,
+# re-blocked on the next burst. If the address is still being misused when the
+# hold expires, the next run simply blocks it again.
+BLOCK_HOLD_HOURS="${BLOCK_HOLD_HOURS:-12}"
+STATE_FILE="${STATE_FILE:-/tmp/wlan-guard.blocks}"     # one "<ip> <epoch>" line
+
 # MQTT (optional): publish a message every time an IP is blocked or unblocked.
 # No-op unless MQTT_HOST is set and mosquitto_pub (mosquitto-client) is
 # installed, so leaving it unset changes nothing. Two topics are published:
@@ -153,10 +166,9 @@ mqtt_pub() {
 	mosquitto_pub "$@" 2>/dev/null || log "mqtt publish failed ($_action $_ip)"
 }
 
-# Set math on line-files. BusyBox grep treats an EMPTY -f pattern file as
-# "match every line" (opposite of GNU/BSD), so both helpers special-case it.
+# Set subtraction on line-files. BusyBox grep treats an EMPTY -f pattern file
+# as "match every line" (the opposite of GNU/BSD), hence the -s guard.
 minus() { if [ -s "$2" ]; then grep -vxF -f "$2" "$1"; else cat "$1"; fi; }  # $1 \ $2
-inter() { if [ -s "$2" ]; then grep -xF  -f "$2" "$1"; fi; }                 # $1 ∩ $2
 
 # AP-mode wireless interfaces (Master mode only, so we never read a STA/mesh
 # uplink and mistake the upstream AP for a client).
@@ -313,6 +325,28 @@ fw_flush() {
 }
 
 # ---------------------------------------------------------------------------
+# Block ledger: when each IP was blocked, so the hold can outlive the evidence
+# that triggered it. Kept in /tmp because the firewall rules it describes are
+# themselves lost on reboot, so the two always expire together.
+# ---------------------------------------------------------------------------
+state_get() {                  # $1 = ip -> epoch it was blocked ("" if unknown)
+	[ -r "$STATE_FILE" ] || return 0
+	awk -v ip="$1" '$1 == ip { t = $2 } END { if (t != "") print t }' "$STATE_FILE"
+}
+
+state_set() {                  # $1 = ip, $2 = epoch
+	_new="$STATE_FILE.$$"
+	{ [ -r "$STATE_FILE" ] && awk -v ip="$1" '$1 != ip' "$STATE_FILE"
+	  echo "$1 $2"; } > "$_new" && mv "$_new" "$STATE_FILE"
+}
+
+state_del() {                  # $1 = ip
+	[ -r "$STATE_FILE" ] || return 0
+	_new="$STATE_FILE.$$"
+	awk -v ip="$1" '$1 != ip' "$STATE_FILE" > "$_new" && mv "$_new" "$STATE_FILE"
+}
+
+# ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
 cmd_flush() {
@@ -322,6 +356,7 @@ cmd_flush() {
 		mqtt_pub unblocked "$ip" "manual flush"
 	done
 	fw_flush
+	rm -f "$STATE_FILE"
 	log "flushed: all wlan-guard firewall state removed, everyone unblocked"
 }
 
@@ -358,7 +393,21 @@ cmd_status() {
 		printf '                %s  %s  (granted: %s)\n' "$m" "$ipshow" "$granted"
 	done < "$st/cand"
 	echo "blocked IPs   : $(fw_current | sort -u | grep -c .)"
+	nowsec="$(date +%s)"
+	fw_current | sort -u | while IFS= read -r ip; do
+		[ -n "$ip" ] || continue
+		since="$(state_get "$ip")"
+		case "$since" in ''|*[!0-9]*)
+			printf '                %s  (not in ledger; hold starts next run)\n' "$ip"
+			continue ;;
+		esac
+		left=$((BLOCK_HOLD_HOURS * 3600 - (nowsec - since)))
+		[ "$left" -lt 0 ] && left=0
+		printf '                %s  %dh%02dm left of %sh hold\n' \
+			"$ip" $((left / 3600)) $(((left % 3600) / 60)) "$BLOCK_HOLD_HOURS"
+	done
 	echo "rate rule     : block if > ${RATE_THRESHOLD_KB} kB/s over ${SAMPLE_SECONDS}s"
+	echo "hold rule     : once blocked, stay blocked ${BLOCK_HOLD_HOURS}h, then release"
 	echo
 	case "$BACKEND" in
 	nft)      nft list table inet "$NFT_TABLE" 2>/dev/null || echo "(nft table not installed yet)" ;;
@@ -437,8 +486,23 @@ cmd_run() {
 		done < "$tmp/b1"
 	fi
 
-	# desired = (blocked IPs still held by a device not granted them) + newly triggered
-	inter "$tmp/current" "$tmp/candip" > "$tmp/keep"
+	# desired = (blocked IPs whose hold has not expired yet) + newly triggered.
+	now="$(date +%s)"
+	hold=$((BLOCK_HOLD_HOURS * 3600))
+	: > "$tmp/keep"
+	while IFS= read -r ip; do
+		[ -n "$ip" ] || continue
+		since="$(state_get "$ip")"
+		case "$since" in ''|*[!0-9]*) since="" ;; esac
+		if [ -z "$since" ]; then
+			# Blocked but not in the ledger (state file lost, or the rule was
+			# added by hand): adopt it now so it still gets a bounded life.
+			[ "$DRYRUN" = 1 ] || state_set "$ip" "$now"
+			echo "$ip" >> "$tmp/keep"
+		elif [ $((now - since)) -lt "$hold" ]; then
+			echo "$ip" >> "$tmp/keep"
+		fi
+	done < "$tmp/current"
 	cat "$tmp/keep" "$tmp/toblock" 2>/dev/null | sort -u > "$tmp/desired"
 
 	minus "$tmp/desired" "$tmp/current" > "$tmp/toadd"   # new blocks
@@ -449,15 +513,17 @@ cmd_run() {
 		[ -n "$ip" ] || continue
 		if [ "$DRYRUN" = 1 ]; then :; else
 			reason="address not granted to this device, active >${RATE_THRESHOLD_KB}kB/s"
-			fw_block "$ip" && { log "BLOCK $ip ($reason)"; added=$((added+1)); mqtt_pub blocked "$ip" "$reason"; }
+			fw_block "$ip" && { state_set "$ip" "$now"; log "BLOCK $ip ($reason)"
+				added=$((added+1)); mqtt_pub blocked "$ip" "$reason"; }
 		fi
 	done < "$tmp/toadd"
 
 	while IFS= read -r ip; do
 		[ -n "$ip" ] || continue
-		why="no longer held by a device without a grant for it (left, or moved to its own address)"
+		why="${BLOCK_HOLD_HOURS}h hold expired, giving the address another chance"
 		if [ "$DRYRUN" = 1 ]; then echo "$TAG: WOULD UNBLOCK $ip ($why)"; else
-			fw_unblock "$ip" && { log "UNBLOCK $ip ($why)"; removed=$((removed+1)); mqtt_pub unblocked "$ip" "$why"; }
+			fw_unblock "$ip" && { state_del "$ip"; log "UNBLOCK $ip ($why)"
+				removed=$((removed+1)); mqtt_pub unblocked "$ip" "$why"; }
 		fi
 	done < "$tmp/todel"
 
