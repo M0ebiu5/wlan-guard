@@ -1,0 +1,9 @@
+.DS_Store
+*.swp
+*.bak
+/tmp/
+memory/
+
+# Site data and credentials stay on the router, never in the repo.
+*.whitelist
+*_cred*

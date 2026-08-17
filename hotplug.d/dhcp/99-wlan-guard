@@ -1,0 +1,32 @@
+#!/bin/sh
+#
+# /etc/hotplug.d/dhcp/99-wlan-guard
+#
+# Fires whenever dnsmasq adds or removes a DHCP lease. A device that has
+# just joined the Wi-Fi and pulled an address triggers ACTION=add here, so
+# wlan-guard evaluates (and blocks, if unknown) within a second or two
+# instead of waiting for the next cron tick.
+#
+# wlan-guard's reconcile is whole-network and idempotent, so this hook does
+# not care which MAC/IP changed — it just kicks a single run. It is
+# backgrounded so dnsmasq is never blocked on us.
+#
+# Hotplug env provided by OpenWrt: ACTION (add|del|old), MACADDR, IPADDR,
+# HOSTNAME. We act only on real lease changes, not on 'old' (renew/restart).
+#
+# NOTE: this covers devices that use DHCP. Static-IP rogues, and clients
+# that leave the air, are still caught by the cron backstop (and, if you
+# install it, the hostapd AP-STA event watcher). Adjust GUARD if you placed
+# the script somewhere other than /root.
+
+GUARD="/root/wlan-guard.sh"
+
+case "$ACTION" in
+	add|del) ;;
+	*) exit 0 ;;
+esac
+
+[ -x "$GUARD" ] || exit 0
+
+"$GUARD" run >/dev/null 2>&1 &
+exit 0
