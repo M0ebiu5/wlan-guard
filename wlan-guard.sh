@@ -12,8 +12,9 @@
 #   BLOCK      = the unauthorized IPv4 address(es) of a candidate that is
 #                transferring faster than RATE_THRESHOLD_KB
 #   keep       = an already-blocked IP whose hold has not run out yet
-#   UNBLOCK    = a blocked IP whose BLOCK_HOLD_HOURS hold has expired (the
-#                air, went back to its own address, or moved again)
+#   UNBLOCK    = a blocked IP or MAC whose BLOCK_HOLD_HOURS hold has expired
+#   BLOCK MAC  = the candidate's own MAC, dropped outright (BLOCK_MACS=1), so
+#                one rule covers every address it is holding at once
 #
 # The test is on the PAIR, not the MAC. Holding a lease does not entitle a
 # device to any other address: a MAC leased .50 that is sitting on static .155
@@ -90,6 +91,7 @@ TAG="wlan-guard"
 V4CHAIN="WLAN_GUARD"                                   # iptables chain name
 NFT_TABLE="wlan_guard"                                 # nft table name
 NFT_SET="blocked"                                      # ipv4_addr set of blocked IPs
+NFT_MACSET="blocked_macs"                              # ether_addr set of blocked MACs
 
 WLAN_IFACES="${WLAN_IFACES:-}"                         # blank = auto-detect AP ifaces
 WHITELIST_FILE="${WHITELIST_FILE:-/etc/wlan-guard.whitelist}"
@@ -106,7 +108,16 @@ CT_FILE="${CT_FILE:-/proc/net/nf_conntrack}"
 # re-blocked on the next burst. If the address is still being misused when the
 # hold expires, the next run simply blocks it again.
 BLOCK_HOLD_HOURS="${BLOCK_HOLD_HOURS:-12}"
-STATE_FILE="${STATE_FILE:-/tmp/wlan-guard.blocks}"     # one "<ip> <epoch>" line
+STATE_FILE="${STATE_FILE:-/tmp/wlan-guard.blocks}"     # one "<key> <epoch>" line
+
+# Also drop the offender's MAC outright, not just the address(es) it is abusing.
+# A MAC block stops the device in one rule however many addresses it holds, and
+# it spares the rightful owners of those addresses. It is not a replacement for
+# the address blocks: a device that randomizes its MAC while keeping a static
+# IP is caught by the address block and would walk straight past a MAC block,
+# so both are applied. Requires the xt_mac match (iptables) or an ether_addr
+# set (nft); if that is missing the address block still stands on its own.
+BLOCK_MACS="${BLOCK_MACS:-1}"
 
 # MQTT (optional): publish a message every time an IP is blocked or unblocked.
 # No-op unless MQTT_HOST is set and mosquitto_pub (mosquitto-client) is
@@ -149,16 +160,17 @@ log()  { logger -t "$TAG" -- "$*" 2>/dev/null; [ -t 2 ] && echo "$TAG: $*" >&2; 
 
 # Publish a block/unblock state change to MQTT. Silent no-op if MQTT is not
 # configured or mosquitto_pub is missing; a broker error is logged, never fatal.
-#   $1 = action (blocked|unblocked)   $2 = ip   $3 = human-readable reason
+#   $1 = action (blocked|unblocked)   $2 = ip or MAC   $3 = reason
+#   $4 = payload field name for $2, "ip" (default) or "mac"
 # Payload is JSON with an ISO-8601 UTC timestamp taken at the moment of change.
 mqtt_pub() {
 	[ -n "$MQTT_HOST" ] && have mosquitto_pub || return 0
 	# Saved before the `set --` below rebuilds the argument list and takes
 	# $1/$2/$3 with it.
-	_action="$1"; _ip="$2"; _reason="$3"
+	_action="$1"; _ip="$2"; _reason="$3"; _field="${4:-ip}"
 	_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 	_topic="$MQTT_TOPIC/$_action"
-	_payload="{\"action\":\"$_action\",\"ip\":\"$_ip\",\"reason\":\"$_reason\",\"time\":\"$_ts\",\"router\":\"$(uname -n)\"}"
+	_payload="{\"action\":\"$_action\",\"$_field\":\"$_ip\",\"reason\":\"$_reason\",\"time\":\"$_ts\",\"router\":\"$(uname -n)\"}"
 	set -- -h "$MQTT_HOST" -p "$MQTT_PORT" -q "$MQTT_QOS" -t "$_topic" -m "$_payload"
 	[ "$MQTT_RETAIN" = 1 ] && set -- "$@" -r
 	[ -n "$MQTT_USER" ] && set -- "$@" -u "$MQTT_USER"
@@ -272,14 +284,20 @@ fw_ensure() {
 		nft -f - <<EOF
 table inet $NFT_TABLE {
 	set $NFT_SET { type ipv4_addr ; }
-	chain input   { type filter hook input   priority -1; policy accept; ip saddr @$NFT_SET drop }
-	chain forward { type filter hook forward priority -1; policy accept; ip saddr @$NFT_SET drop }
+	set $NFT_MACSET { type ether_addr ; }
+	chain input   { type filter hook input   priority -1; policy accept; udp dport 67 return; ip saddr @$NFT_SET drop; ether saddr @$NFT_MACSET drop }
+	chain forward { type filter hook forward priority -1; policy accept; udp dport 67 return; ip saddr @$NFT_SET drop; ether saddr @$NFT_MACSET drop }
 }
 EOF
 		;;
 	iptables)
 		# IPv4 only: we drop by source IPv4 address, so no ip6tables chain.
 		iptables -w -N "$V4CHAIN" 2>/dev/null
+		# DHCP stays open even for a blocked device, so a host that is merely
+		# misconfigured can still get a proper lease and stop being a candidate
+		# on its own. RETURN, not ACCEPT: the rest of the firewall still applies.
+		iptables -w -C "$V4CHAIN" -p udp --dport 67 -j RETURN 2>/dev/null \
+			|| iptables -w -I "$V4CHAIN" 1 -p udp --dport 67 -j RETURN
 		iptables -w -C INPUT   -j "$V4CHAIN" 2>/dev/null || iptables -w -I INPUT   1 -j "$V4CHAIN"
 		iptables -w -C FORWARD -j "$V4CHAIN" 2>/dev/null || iptables -w -I FORWARD 1 -j "$V4CHAIN"
 		;;
@@ -307,6 +325,33 @@ fw_unblock() {
 	nft) nft delete element inet "$NFT_TABLE" "$NFT_SET" "{ $1 }" 2>/dev/null ;;
 	iptables)
 		iptables -w -D "$V4CHAIN" -s "$1" -j DROP 2>/dev/null ;;
+	esac
+}
+
+# Same three operations, keyed on the MAC instead of the address.
+fw_current_macs() {
+	case "$BACKEND" in
+	nft)      nft list set inet "$NFT_TABLE" "$NFT_MACSET" 2>/dev/null \
+			| grep -oiE "$MAC_RE" | tr 'A-F' 'a-f' ;;
+	iptables) iptables -w -S "$V4CHAIN" 2>/dev/null \
+			| sed -n 's/.*--mac-source \([0-9A-Fa-f:]\{17\}\).*/\1/p' | tr 'A-F' 'a-f' ;;
+	esac
+}
+
+fw_block_mac() {
+	case "$BACKEND" in
+	nft) nft add element inet "$NFT_TABLE" "$NFT_MACSET" "{ $1 }" ;;
+	iptables)
+		iptables -w -C "$V4CHAIN" -m mac --mac-source "$1" -j DROP 2>/dev/null \
+			|| iptables -w -A "$V4CHAIN" -m mac --mac-source "$1" -j DROP ;;
+	esac
+}
+
+fw_unblock_mac() {
+	case "$BACKEND" in
+	nft) nft delete element inet "$NFT_TABLE" "$NFT_MACSET" "{ $1 }" 2>/dev/null ;;
+	iptables)
+		iptables -w -D "$V4CHAIN" -m mac --mac-source "$1" -j DROP 2>/dev/null ;;
 	esac
 }
 
@@ -406,8 +451,24 @@ cmd_status() {
 		printf '                %s  %dh%02dm left of %sh hold\n' \
 			"$ip" $((left / 3600)) $(((left % 3600) / 60)) "$BLOCK_HOLD_HOURS"
 	done
+	if [ "$BLOCK_MACS" = 1 ]; then
+		echo "blocked MACs  : $(fw_current_macs | sort -u | grep -c .)"
+		fw_current_macs | sort -u | while IFS= read -r mc; do
+			[ -n "$mc" ] || continue
+			since="$(state_get "$mc")"
+			case "$since" in ''|*[!0-9]*)
+				printf '                %s  (not in ledger; hold starts next run)\n' "$mc"
+				continue ;;
+			esac
+			left=$((BLOCK_HOLD_HOURS * 3600 - (nowsec - since)))
+			[ "$left" -lt 0 ] && left=0
+			printf '                %s  %dh%02dm left of %sh hold\n' \
+				"$mc" $((left / 3600)) $(((left % 3600) / 60)) "$BLOCK_HOLD_HOURS"
+		done
+	fi
 	echo "rate rule     : block if > ${RATE_THRESHOLD_KB} kB/s over ${SAMPLE_SECONDS}s"
 	echo "hold rule     : once blocked, stay blocked ${BLOCK_HOLD_HOURS}h, then release"
+	echo "mac rule      : $([ "$BLOCK_MACS" = 1 ] && echo "also drop the offender's MAC" || echo "addresses only")"
 	echo
 	case "$BACKEND" in
 	nft)      nft list table inet "$NFT_TABLE" 2>/dev/null || echo "(nft table not installed yet)" ;;
@@ -422,6 +483,7 @@ cmd_run() {
 	tmp="$(mktemp -d /tmp/wlan-guard.XXXXXX)" || die "mktemp failed"
 	trap 'rm -rf "$tmp"' EXIT
 	: > "$tmp/toblock"      # IPs to newly block this run (rate-triggered)
+	: > "$tmp/toblockmac"   # MACs to newly block this run (same trigger)
 	: > "$tmp/candip"       # every v4 IP held by an associated MAC not entitled to it
 	: > "$tmp/macips"       # "<mac> <v4ip...>" for candidates that hold such an IP
 
@@ -452,12 +514,21 @@ cmd_run() {
 	sort -u "$tmp/candip" > "$tmp/candip.s" && mv "$tmp/candip.s" "$tmp/candip"
 
 	# Measure a candidate only if it holds at least one IP not already blocked.
+	# If one of its addresses is already blocked then the rate test has already
+	# fired for this device once, so its MAC is blocked without waiting for
+	# another sample -- which it would never produce, because the address block
+	# has already stopped its traffic.
 	: > "$tmp/measure"
 	while IFS= read -r line; do
 		m="${line%% *}"; ips="${line#* }"
+		fresh=0; seenblocked=0
 		for ip in $ips; do
-			grep -qxF "$ip" "$tmp/current" || { echo "$line" >> "$tmp/measure"; break; }
+			if grep -qxF "$ip" "$tmp/current"; then seenblocked=1; else fresh=1; fi
 		done
+		[ "$fresh" = 1 ] && echo "$line" >> "$tmp/measure"
+		if [ "$seenblocked" = 1 ] && [ "$BLOCK_MACS" = 1 ]; then
+			echo "$m|already blocked on an address it was not granted" >> "$tmp/toblockmac"
+		fi
 	done < "$tmp/macips"
 
 	if [ -s "$tmp/measure" ]; then
@@ -479,6 +550,9 @@ cmd_run() {
 			ipshow="$(echo $ips | tr ' ' ',' | sed 's/,$//')"
 			if [ "$rate" -gt "$RATE_THRESHOLD_KB" ]; then
 				for ip in $ips; do echo "$ip" >> "$tmp/toblock"; done
+				[ "$BLOCK_MACS" = 1 ] && \
+					echo "$m|holding an address it was not granted, active >${RATE_THRESHOLD_KB}kB/s" \
+						>> "$tmp/toblockmac"
 				[ "$DRYRUN" = 1 ] && echo "$TAG: WOULD BLOCK $m [$ipshow]  ${rate}kB/s"
 			else
 				[ "$DRYRUN" = 1 ] && echo "$TAG: skip $m [$ipshow]  ${rate}kB/s <= ${RATE_THRESHOLD_KB}"
@@ -526,6 +600,50 @@ cmd_run() {
 				removed=$((removed+1)); mqtt_pub unblocked "$ip" "$why"; }
 		fi
 	done < "$tmp/todel"
+
+	# --- the same reconcile, keyed on MAC ---------------------------------
+	if [ "$BLOCK_MACS" = 1 ]; then
+		fw_current_macs | sort -u > "$tmp/curmac"
+		: > "$tmp/keepmac"
+		while IFS= read -r mc; do
+			[ -n "$mc" ] || continue
+			since="$(state_get "$mc")"
+			case "$since" in ''|*[!0-9]*) since="" ;; esac
+			if [ -z "$since" ]; then
+				[ "$DRYRUN" = 1 ] || state_set "$mc" "$now"
+				echo "$mc" >> "$tmp/keepmac"
+			elif [ $((now - since)) -lt "$hold" ]; then
+				echo "$mc" >> "$tmp/keepmac"
+			fi
+		done < "$tmp/curmac"
+		{ cat "$tmp/keepmac"; cut -d'|' -f1 "$tmp/toblockmac"; } 2>/dev/null \
+			| sort -u > "$tmp/desiredmac"
+		minus "$tmp/desiredmac" "$tmp/curmac" > "$tmp/toaddmac"
+		minus "$tmp/curmac" "$tmp/desiredmac" > "$tmp/todelmac"
+
+		while IFS= read -r mc; do
+			[ -n "$mc" ] || continue
+			reason="$(awk -F'|' -v m="$mc" '$1 == m { print $2; exit }' "$tmp/toblockmac")"
+			[ -n "$reason" ] || reason="holding an address it was not granted"
+			if [ "$DRYRUN" = 1 ]; then echo "$TAG: WOULD BLOCK MAC $mc ($reason)"; else
+				if fw_block_mac "$mc"; then
+					state_set "$mc" "$now"; log "BLOCK MAC $mc ($reason)"
+					added=$((added+1)); mqtt_pub blocked "$mc" "$reason" mac
+				else
+					log "mac block failed for $mc (no xt_mac / ether_addr set?); address block still stands"
+				fi
+			fi
+		done < "$tmp/toaddmac"
+
+		while IFS= read -r mc; do
+			[ -n "$mc" ] || continue
+			why="${BLOCK_HOLD_HOURS}h hold expired, giving the device another chance"
+			if [ "$DRYRUN" = 1 ]; then echo "$TAG: WOULD UNBLOCK MAC $mc ($why)"; else
+				fw_unblock_mac "$mc" && { state_del "$mc"; log "UNBLOCK MAC $mc ($why)"
+					removed=$((removed+1)); mqtt_pub unblocked "$mc" "$why" mac; }
+			fi
+		done < "$tmp/todelmac"
+	fi
 
 	[ "$DRYRUN" = 1 ] && return 0
 	{ [ "$added" -gt 0 ] || [ "$removed" -gt 0 ]; } && \
