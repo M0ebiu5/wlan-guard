@@ -107,7 +107,7 @@ CT_FILE="${CT_FILE:-/proc/net/nf_conntrack}"
 # "device looks gone" made blocks flap: blocked, released a few minutes later,
 # re-blocked on the next burst. If the address is still being misused when the
 # hold expires, the next run simply blocks it again.
-BLOCK_HOLD_HOURS="${BLOCK_HOLD_HOURS:-12}"
+BLOCK_HOLD_HOURS="${BLOCK_HOLD_HOURS:-3}"
 STATE_FILE="${STATE_FILE:-/tmp/wlan-guard.blocks}"     # one "<key> <epoch>" line
 
 # Also drop the offender's MAC outright, not just the address(es) it is abusing.
