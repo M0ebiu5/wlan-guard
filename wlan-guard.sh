@@ -398,7 +398,9 @@ cmd_run() {
 		printf '%s\n' $v4 >> "$tmp/candip"
 		echo "$m $v4" >> "$tmp/macips"
 	done < "$tmp/cand"
-	sort -u "$tmp/candip" -o "$tmp/candip"
+	# BusyBox sort has no -o: write via a temp file, or the list leaks to
+	# stdout and the original is left undeduplicated.
+	sort -u "$tmp/candip" > "$tmp/candip.s" && mv "$tmp/candip.s" "$tmp/candip"
 
 	# Measure a candidate only if it holds at least one IP not already blocked.
 	: > "$tmp/measure"
