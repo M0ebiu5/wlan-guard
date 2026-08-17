@@ -39,6 +39,13 @@
 # stands for BLOCK_HOLD_HOURS and is then released; if the address is still
 # being misused, the next run blocks it again.
 #
+# A block therefore ends on its own only when the hold runs out. An operator can
+# also end one early: `wlan-guard.sh unblock <ip|mac|all>` drops the rule and the
+# ledger entry with it. That releases and nothing more — the next run judges the
+# network from scratch, so a device still sitting on an address it was not
+# granted is blocked again within one cron tick. Whitelist its MAC to exempt it
+# for good.
+#
 # Authorized pairs = active DHCP leases (/tmp/dhcp.leases: the MAC the router
 # actually handed each IP to) plus static reservations (uci dhcp 'host' with
 # both mac and ip). On a busy network most devices are dynamic-lease holders,
@@ -71,10 +78,13 @@
 #
 # BusyBox ash / POSIX sh only. No arrays, no bashisms.
 #
-# Usage:  wlan-guard.sh [run|status|list|flush] [--dry-run]
+# Usage:  wlan-guard.sh [run|status|list|unblock TARGET...|flush] [--dry-run]
 #   run      (default) measure + reconcile the block list.
 #   status   show counts + the live firewall ruleset (no measuring).
 #   list     print the IPs currently blocked.
+#   unblock  release blocks now: IPv4 address(es), MAC(s), or the word 'all'.
+#            The hold is dropped along with the block, so the next run is free
+#            to block again if the device is still misusing an address.
 #   flush    tear down all wlan-guard firewall state (unblock everyone).
 #   --dry-run / -n   measure and print decisions, change nothing.
 #
@@ -141,13 +151,17 @@ IPV4_RE='([0-9]{1,3}\.){3}[0-9]{1,3}'
 # ---------------------------------------------------------------------------
 CMD="run"
 DRYRUN=0
+TARGETS=""                     # unblock operands, in the order given
 for arg in "$@"; do
 	case "$arg" in
-		run|status|list|flush) CMD="$arg" ;;
+		run|status|list|flush|unblock) CMD="$arg" ;;
 		--dry-run|-n)          DRYRUN=1 ;;
 		# print the header comment block, however long it grows
 		--help|-h)             awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
-		*) echo "$TAG: unknown argument: $arg" >&2; exit 2 ;;
+		-*) echo "$TAG: unknown option: $arg" >&2; exit 2 ;;
+		# Bare words mean nothing to run/status/list/flush; they are unblock's
+		# operands, so hold them and let the dispatch reject strays.
+		*) TARGETS="$TARGETS $arg" ;;
 	esac
 done
 
@@ -157,6 +171,10 @@ done
 have() { command -v "$1" >/dev/null 2>&1; }
 die()  { echo "$TAG: $*" >&2; exit 2; }
 log()  { logger -t "$TAG" -- "$*" 2>/dev/null; [ -t 2 ] && echo "$TAG: $*" >&2; }
+
+# Only 'unblock' takes operands. Rejecting them everywhere else keeps a typo
+# ("wlan-guard.sh run 192.168.4.5") from looking like it did something.
+no_targets() { [ -z "$TARGETS" ] || die "unknown argument:$TARGETS"; }
 
 # Publish a block/unblock state change to MQTT. Silent no-op if MQTT is not
 # configured or mosquitto_pub is missing; a broker error is logged, never fatal.
@@ -400,12 +418,87 @@ cmd_flush() {
 		[ -n "$ip" ] || continue
 		mqtt_pub unblocked "$ip" "manual flush"
 	done
+	fw_current_macs | sort -u | while IFS= read -r mc; do
+		[ -n "$mc" ] || continue
+		mqtt_pub unblocked "$mc" "manual flush" mac
+	done
 	fw_flush
 	rm -f "$STATE_FILE"
 	log "flushed: all wlan-guard firewall state removed, everyone unblocked"
 }
 
 cmd_list() { fw_detect; fw_current | sort -u; }
+
+# Manual release. The hold is how a block normally ends, but an operator needs a
+# way to take one back now: the rightful owner reclaiming an address that is
+# still dropped from the squatter's turn on it, or simply a call to overrule.
+# Takes any mix of IPv4 addresses and MACs, or 'all' for everything blocked.
+cmd_unblock() {                # "$@" = ip | mac | all
+	fw_detect
+	[ "$#" -gt 0 ] || die "unblock needs an IPv4 address, a MAC, or 'all'"
+
+	if [ "$1" = all ]; then
+		[ "$#" = 1 ] || die "'all' takes no other arguments"
+		# Expand before anything is removed, so what is reported is what was
+		# actually released. Unquoted on purpose: this is a word list.
+		set -- $(fw_current | sort -u) $(fw_current_macs | sort -u)
+		[ "$#" -gt 0 ] || { log "unblock all: nothing is blocked"; return 0; }
+	fi
+
+	released=0
+	for t in "$@"; do
+		[ "$t" = all ] && die "'all' cannot be mixed with addresses"
+		if echo "$t" | grep -qE "^$IPV4_RE\$"; then
+			if ! fw_current | grep -qxF "$t"; then
+				log "unblock: $t is not blocked"
+				continue
+			fi
+			if [ "$DRYRUN" = 1 ]; then
+				echo "WOULD UNBLOCK $t (manual)"
+			else
+				fw_unblock "$t" || { log "unblock failed: $t"; continue; }
+				state_del "$t"
+				log "UNBLOCK $t (manual release)"
+				mqtt_pub unblocked "$t" "manual release"
+			fi
+			released=$((released + 1))
+		elif echo "$t" | grep -qE "^$MAC_RE\$"; then
+			mc="$(echo "$t" | tr 'A-F' 'a-f')"
+			if ! fw_current_macs | grep -qxF "$mc"; then
+				log "unblock: MAC $mc is not blocked"
+				continue
+			fi
+			if [ "$DRYRUN" = 1 ]; then
+				echo "WOULD UNBLOCK MAC $mc (manual)"
+			else
+				fw_unblock_mac "$mc" || { log "unblock failed: MAC $mc"; continue; }
+				state_del "$mc"
+				log "UNBLOCK MAC $mc (manual release)"
+				mqtt_pub unblocked "$mc" "manual release" mac
+			fi
+			released=$((released + 1))
+		else
+			die "not an IPv4 address or MAC: $t"
+		fi
+	done
+
+	if [ "$DRYRUN" = 1 ]; then
+		log "unblock: would release $released (dry run, nothing changed)"
+		return 0
+	fi
+	[ "$released" -gt 0 ] || return 0
+
+	# An address release does not put a device back on the air while its MAC is
+	# still dropped, and vice versa. Report what still stands so a half release
+	# does not look like a failed one.
+	log "unblock: released $released; still blocked: $(fw_current | sort -u | grep -c .) address(es), $(fw_current_macs | sort -u | grep -c .) MAC(s)"
+	if [ -t 2 ]; then
+		echo "$TAG: note: the next run re-blocks any device still using an address it" >&2
+		echo "$TAG:       was not granted. To exempt it, whitelist its MAC in" >&2
+		echo "$TAG:       $WHITELIST_FILE." >&2
+	fi
+	return 0
+}
 
 cmd_status() {
 	have iwinfo || die "iwinfo not found"
@@ -469,6 +562,7 @@ cmd_status() {
 	echo "rate rule     : block if > ${RATE_THRESHOLD_KB} kB/s over ${SAMPLE_SECONDS}s"
 	echo "hold rule     : once blocked, stay blocked ${BLOCK_HOLD_HOURS}h, then release"
 	echo "mac rule      : $([ "$BLOCK_MACS" = 1 ] && echo "also drop the offender's MAC" || echo "addresses only")"
+	echo "manual        : wlan-guard.sh unblock <ip|mac|all> releases early"
 	echo
 	case "$BACKEND" in
 	nft)      nft list table inet "$NFT_TABLE" 2>/dev/null || echo "(nft table not installed yet)" ;;
@@ -653,8 +747,10 @@ cmd_run() {
 
 # ---------------------------------------------------------------------------
 case "$CMD" in
-	run)    cmd_run ;;
-	status) cmd_status ;;
-	list)   cmd_list ;;
-	flush)  cmd_flush ;;
+	run)     no_targets; cmd_run ;;
+	status)  no_targets; cmd_status ;;
+	list)    no_targets; cmd_list ;;
+	flush)   no_targets; cmd_flush ;;
+	# Unquoted on purpose: the operands are a word list of addresses/MACs.
+	unblock) cmd_unblock $TARGETS ;;
 esac
