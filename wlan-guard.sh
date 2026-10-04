@@ -78,13 +78,16 @@
 #
 # BusyBox ash / POSIX sh only. No arrays, no bashisms.
 #
-# Usage:  wlan-guard.sh [run|status|list|unblock TARGET...|flush] [--dry-run]
+# Usage:  wlan-guard.sh [run|status|list|unblock TARGET...|listen|flush] [--dry-run]
 #   run      (default) measure + reconcile the block list.
 #   status   show counts + the live firewall ruleset (no measuring).
-#   list     print the IPs currently blocked.
+#   list     print the IPs currently blocked, with each one's MAC if known.
 #   unblock  release blocks now: IPv4 address(es), MAC(s), or the word 'all'.
 #            The hold is dropped along with the block, so the next run is free
 #            to block again if the device is still misusing an address.
+#   listen   foreground MQTT command listener (run as the wlan-guard-mqtt
+#            procd service, not from cron): each message on MQTT_CMD_TOPIC
+#            unblocks its payload (one ip/mac/'all' per message).
 #   flush    tear down all wlan-guard firewall state (unblock everyone).
 #   --dry-run / -n   measure and print decisions, change nothing.
 #
@@ -134,10 +137,17 @@ BLOCK_MACS="${BLOCK_MACS:-1}"
 # installed, so leaving it unset changes nothing. Two topics are published:
 # <MQTT_TOPIC>/blocked and <MQTT_TOPIC>/unblocked. MQTT_TOPIC defaults to
 # <MQTT_BASE>/wlan-guard; set it directly to control the whole prefix.
+#
+# The reverse direction ('listen', run as a procd service — see
+# /etc/init.d/wlan-guard-mqtt) subscribes to MQTT_CMD_TOPIC and treats each
+# message's payload as one 'wlan-guard.sh unblock' operand: an IPv4 address,
+# a MAC, or 'all'. Reuses cmd_unblock's validation, so a garbage payload is
+# logged and ignored rather than acted on.
 MQTT_HOST="${MQTT_HOST:-}"                             # broker host; blank = MQTT off
 MQTT_PORT="${MQTT_PORT:-1883}"
 MQTT_BASE="${MQTT_BASE:-openwrt}"                      # base topic
 MQTT_TOPIC="${MQTT_TOPIC:-$MQTT_BASE/wlan-guard}"      # full topic prefix; <prefix>/<action>
+MQTT_CMD_TOPIC="${MQTT_CMD_TOPIC:-$MQTT_TOPIC/cmd/unblock}"  # 'listen' subscribes here
 MQTT_USER="${MQTT_USER:-}"                             # optional broker username
 MQTT_PASS="${MQTT_PASS:-}"                             # optional broker password
 MQTT_QOS="${MQTT_QOS:-0}"
@@ -154,7 +164,7 @@ DRYRUN=0
 TARGETS=""                     # unblock operands, in the order given
 for arg in "$@"; do
 	case "$arg" in
-		run|status|list|flush|unblock) CMD="$arg" ;;
+		run|status|list|flush|unblock|listen) CMD="$arg" ;;
 		--dry-run|-n)          DRYRUN=1 ;;
 		# print the header comment block, however long it grows
 		--help|-h)             awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
@@ -264,6 +274,20 @@ ips_for_mac() {
 
 # Just the IPv4 address(es) a MAC currently holds — what we actually block on.
 ipv4s_for_mac() { ips_for_mac "$1" | grep -oE "^$IPV4_RE$"; }
+
+# Reverse of ips_for_mac: the MAC currently holding an IPv4 address, from the
+# neighbour table. Same FAILED/INCOMPLETE skip — those entries are stale, not
+# evidence of who holds the address now. Blank if the address is gone from the
+# table (block is old enough that ARP/NDP aged it out).
+mac_for_ip() {
+	ip neigh show 2>/dev/null | awk -v ip="$1" '
+		$1 == ip {
+			state = $NF
+			if (state == "FAILED" || state == "INCOMPLETE") next
+			for (i = 1; i <= NF; i++)
+				if ($i == "lladdr") { print tolower($(i+1)); exit }
+		}'
+}
 
 # The IPv4 address(es) a MAC holds that no lease/reservation grants it — the
 # ones we are entitled to drop.  $1 = lowercase MAC, $2 = file of known pairs.
@@ -427,7 +451,15 @@ cmd_flush() {
 	log "flushed: all wlan-guard firewall state removed, everyone unblocked"
 }
 
-cmd_list() { fw_detect; fw_current | sort -u; }
+cmd_list() {
+	fw_detect
+	fw_current | sort -u | while IFS= read -r ip; do
+		[ -n "$ip" ] || continue
+		mac="$(mac_for_ip "$ip")"
+		[ -n "$mac" ] || mac="(unknown)"
+		printf '%s  %s\n' "$ip" "$mac"
+	done
+}
 
 # Manual release. The hold is how a block normally ends, but an operator needs a
 # way to take one back now: the rightful owner reclaiming an address that is
@@ -498,6 +530,34 @@ cmd_unblock() {                # "$@" = ip | mac | all
 		echo "$TAG:       $WHITELIST_FILE." >&2
 	fi
 	return 0
+}
+
+# Foreground MQTT command listener: one 'unblock' operand per message. Meant
+# to run forever as the wlan-guard-mqtt procd service, not from cron — a cron
+# job that never returns would just pile up. Each message is handed to
+# cmd_unblock in its own subshell, so a garbage payload's die() only skips
+# that message (exits the subshell) instead of killing the listener; and a
+# payload never reaches the shell as anything but a literal string, so it
+# cannot inject a second command or expand as a glob.
+cmd_listen() {
+	fw_detect
+	[ -n "$MQTT_HOST" ] || die "MQTT_HOST not set: nothing to subscribe to"
+	have mosquitto_sub || die "mosquitto_sub not found (install mosquitto-client)"
+
+	# -R: skip any retained message on connect, so a stale command left on the
+	# topic from before a restart is not replayed and re-run.
+	set -- -h "$MQTT_HOST" -p "$MQTT_PORT" -t "$MQTT_CMD_TOPIC" -q "$MQTT_QOS" -R
+	[ -n "$MQTT_USER" ] && set -- "$@" -u "$MQTT_USER"
+	[ -n "$MQTT_PASS" ] && set -- "$@" -P "$MQTT_PASS"
+
+	log "listening for unblock commands on $MQTT_CMD_TOPIC"
+	mosquitto_sub "$@" | while IFS= read -r payload; do
+		payload="$(printf '%s' "$payload" | tr -d '\r')"
+		[ -n "$payload" ] || continue
+		log "mqtt command: unblock $payload"
+		( cmd_unblock "$payload" )
+	done
+	log "mqtt listener exited (mosquitto_sub disconnected); procd should restart it"
 }
 
 cmd_status() {
@@ -753,4 +813,5 @@ case "$CMD" in
 	flush)   no_targets; cmd_flush ;;
 	# Unquoted on purpose: the operands are a word list of addresses/MACs.
 	unblock) cmd_unblock $TARGETS ;;
+	listen)  no_targets; cmd_listen ;;
 esac
